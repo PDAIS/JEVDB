@@ -1,0 +1,8 @@
+build/
+.tmp/
+*.duckdb
+*.wal
+.env
+.env.*
+__pycache__/
+*.jsonl
