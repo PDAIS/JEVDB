@@ -3,9 +3,9 @@
 **Scalable semantic SQL on decision models.**
 [Paper](https://arxiv.org/pdf/2610.02046) · [Website](https://jevdb.org)
 
-JEVDB (Just Evaluation and Verification Database) is a DuckDB extension that evaluates
-natural-language predicates inside ordinary SQL: semantic filters, semantic joins,
-classification and scoring.
+JEVDB (Just Evaluation and Verification Database) is a scalable semantic database
+built on the DuckDB ecosystem. It runs semantic filters, semantic joins,
+classification and scoring over text as part of ordinary SQL.
 
 By default JEVDB batches decisions on a Jev model in a single stage. It returns
 probabilities, labels and scores directly, so ordinary semantic filters and joins
