@@ -1,8 +1,9 @@
 # JEVDB
 
 **Scalable semantic SQL on decision models.**
-[Paper](https://arxiv.org/pdf/2610.02046) · [Website](https://jevdb.org)
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/pdf/2610.02046)
+[![Website](https://img.shields.io/badge/Website-JEVDB-CFB991)](https://jevdb.org)
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/PDAIS/JEVDB/blob/main/examples/jevdb_colab.ipynb)
 
 JEVDB (Just Evaluation and Verification Database) is a scalable semantic database
