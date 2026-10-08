@@ -3,6 +3,8 @@
 **Scalable semantic SQL on decision models.**
 [Paper](https://arxiv.org/pdf/2610.02046) · [Website](https://jevdb.org)
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/PDAIS/JEVDB/blob/main/examples/jevdb_colab.ipynb)
+
 JEVDB (Just Evaluation and Verification Database) is a scalable semantic database
 built on the DuckDB ecosystem. It runs semantic filters, semantic joins,
 classification and scoring over text as part of ordinary SQL.
