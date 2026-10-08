@@ -872,7 +872,7 @@ static void Load(ExtensionLoader &loader) {
 	config.AddExtensionOption("jevdb_model", "First-stage model", LogicalType::VARCHAR, Value("jev-1.13.0"));
 	config.AddExtensionOption("jevdb_layout", "Request layout", LogicalType::VARCHAR, Value("auto"));
 	config.AddExtensionOption("jevdb_anchor", "Star anchor", LogicalType::VARCHAR, Value("auto"));
-	config.AddExtensionOption("jevdb_k", "Maximum judgments per request", LogicalType::UBIGINT, Value::UBIGINT(50));
+	config.AddExtensionOption("jevdb_k", "Maximum judgments per request", LogicalType::UBIGINT, Value::UBIGINT(100));
 	config.AddExtensionOption("jevdb_threshold", "Decision probability threshold", LogicalType::DOUBLE,
 	                          Value::DOUBLE(0.5));
 	config.AddExtensionOption("jevdb_budget_tokens", "Estimated request token limit", LogicalType::DOUBLE,

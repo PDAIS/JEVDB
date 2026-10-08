@@ -17,7 +17,7 @@ CREATE SECRET llm (TYPE openai, PROVIDER env); -- OPENAI_API_KEY
 | `jevdb_model` | `jev-1.13.0` | First-stage model |
 | `jevdb_layout` | `auto` | Jev pair layout: auto, star, pack, sep |
 | `jevdb_anchor` | `auto` | Star anchor: auto, left, right |
-| `jevdb_k` | 50 | Maximum judgments per request |
+| `jevdb_k` | 100 | Maximum judgments per request |
 | `jevdb_threads` | 8 | Concurrent first-stage request workers |
 | `jevdb_threshold` | 0.5 | Probability threshold for holds |
 | `jevdb_budget_tokens` | 50000 | Approximate budget from characters / 3.5 |
