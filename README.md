@@ -23,7 +23,23 @@ sends uncertain decisions to a second-stage model.
 
 ## Install
 
-JEVDB is built for DuckDB 1.4.3. Build the extension from source as described in
+For Python and Colab, install the package and open a connection:
+
+```sh
+pip install jevdb
+```
+
+```python
+import jevdb
+
+con = jevdb.connect()
+```
+
+The wheel includes the compiled extension and installs DuckDB 1.4.3. The initial
+binary release targets Linux x86-64, including Colab. See [Python packaging](docs/python.md)
+for local wheel installation and release instructions.
+
+For the DuckDB CLI, build the extension from source as described in
 [Building](docs/building.md), then load it:
 
 ```sql
