@@ -6,3 +6,6 @@ build/
 .env.*
 __pycache__/
 *.jsonl
+dist/
+wheelhouse/
+*.egg-info/

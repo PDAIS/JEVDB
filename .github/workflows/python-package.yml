@@ -1,0 +1,56 @@
+name: Python package
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested wheel and source distribution to PyPI
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          dnf install -y openssl-devel
+          /opt/python/cp312-cp312/bin/python -m pip install build auditwheel wheel twine
+      - name: Build from the source distribution
+        run: /opt/python/cp312-cp312/bin/python -m build
+      - name: Bundle dependencies and preserve DuckDB metadata
+        run: |
+          openssl_license=$(rpm -ql openssl-libs | grep -E '/(LICENSE|LICENSE.txt)$' | head -1)
+          test -n "$openssl_license"
+          /opt/python/cp312-cp312/bin/python tools/repair_python_wheel.py dist/*.whl --plat manylinux_2_28_x86_64 --openssl-license "$openssl_license"
+          cp dist/*.tar.gz wheelhouse/
+          /opt/python/cp312-cp312/bin/python -m twine check wheelhouse/*
+      - name: Install and test the wheel
+        run: |
+          /opt/python/cp312-cp312/bin/python -m pip install wheelhouse/*.whl pandas ipython nbformat
+          /opt/python/cp312-cp312/bin/python -m unittest tools.test_python_package -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: wheelhouse/*
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

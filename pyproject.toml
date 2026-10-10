@@ -1,0 +1,27 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "jevdb"
+version = "0.1.0"
+description = "Semantic SQL on decision models"
+readme = "python/README.md"
+requires-python = ">=3.10"
+dependencies = ["duckdb==1.4.3"]
+
+[project.urls]
+Homepage = "https://jevdb.org"
+Repository = "https://github.com/PDAIS/JEVDB"
+Documentation = "https://github.com/PDAIS/JEVDB/tree/main/docs"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.source-dir = "python"
+cmake.version = ">=3.24,<4"
+build-dir = "build/python/{wheel_tag}"
+wheel.packages = ["python/jevdb"]
+wheel.py-api = "py3"
+# DuckDB stores its extension metadata after the ELF image.
+install.strip = false
+sdist.exclude = [".cache", "dist", "wheelhouse"]
