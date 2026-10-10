@@ -23,7 +23,7 @@ sends uncertain decisions to a second-stage model.
 
 ## Install
 
-For Python and Colab, install the package and open a connection:
+For Python, install the package and open a connection:
 
 ```sh
 pip install jevdb
@@ -34,10 +34,6 @@ import jevdb
 
 con = jevdb.connect()
 ```
-
-The wheel includes the compiled extension and installs DuckDB 1.4.3. The initial
-binary release targets Linux x86-64, including Colab. See [Python packaging](docs/python.md)
-for local wheel installation and release instructions.
 
 For the DuckDB CLI, build the extension from source as described in
 [Building](docs/building.md), then load it:
@@ -51,6 +47,22 @@ LOAD '/absolute/path/to/build/release/extension/jevdb/jevdb.duckdb_extension';
 
 JEVDB uses [Jev](https://docs.typesafe.ai/models) as its decision model. Put your API key in
 `JEV_API_KEY`; keys never appear in SQL.
+
+```python
+rows = con.execute("""
+    CREATE SECRET jev (TYPE jev, PROVIDER env);   -- reads JEV_API_KEY
+
+    SELECT jev_holds(
+        'The review is clearly positive',
+        'Loved every minute of it.'
+    )
+""").fetchall()
+
+print(rows)
+```
+
+Run the following SQL through `con.execute(...)` in Python, or directly in the
+DuckDB CLI. Use `.fetchall()` to retrieve query results.
 
 ```sql
 CREATE SECRET jev (TYPE jev, PROVIDER env);   -- reads JEV_API_KEY
