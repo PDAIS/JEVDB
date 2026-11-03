@@ -422,6 +422,38 @@ class ReleaseBehavior(unittest.TestCase):
         candidates = ' JOIN c ON c.incident=i.id AND c.entry=l.id ORDER BY ALL;'
         self.assertEqual(self.sql(setup + natural + candidates), ['1,10', '2,20'])
 
+    def test_late_join_ordering_keeps_the_columns_selected_above_a_reordered_join(self):
+        # The subquery's join is ordered again in late mode below filters whose projection maps select by position.
+        setup = """
+            CREATE TABLE rep(id INT, text VARCHAR);
+            INSERT INTO rep SELECT i, CASE WHEN i % 2 = 1 THEN 'good report ' ELSE 'report ' END || i FROM range(20) t(i);
+            CREATE TABLE pln(id INT, app VARCHAR);
+            INSERT INTO pln SELECT i, 'plan ' || i FROM range(48) t(i);
+            CREATE TABLE nt(report_id INT, plan_id INT, note VARCHAR);
+            INSERT INTO nt VALUES (0,0,'good'),(0,NULL,'general'),(5,NULL,'n5'),(19,47,'n19');
+            CREATE TABLE ok(report_id INT, plan_id INT);
+            INSERT INTO ok VALUES (0,0),(0,47),(5,47),(19,47),(2,3);
+        """
+        notes = ("(SELECT coalesce(string_agg(nt.note,';' ORDER BY nt.note),'') FROM nt "
+                 "WHERE nt.report_id=rep.id AND (nt.plan_id IS NULL OR nt.plan_id=pln.id))")
+        pair = f"FROM rep JOIN pln ON jev_holds('applies',struct_pack(r:=rep.text,p:=pln.app,n:={notes}))"
+        both = "ok.report_id=rep.id AND ok.plan_id=pln.id"
+        cases = {
+            'alone': (f"SELECT rep.id,pln.id {pair}", 10 * 48 + 1),
+            'an ordinary join above': (f"SELECT rep.id,pln.id {pair} JOIN ok ON {both}", 3),
+            'a LEFT JOIN above': (f"SELECT rep.id,pln.id,ok.plan_id {pair} LEFT JOIN ok ON {both}", 10 * 48 + 1),
+            'EXISTS above': (f"SELECT rep.id,pln.id {pair} WHERE EXISTS (SELECT 1 FROM ok WHERE {both})", 3),
+        }
+        for name, (query, count) in cases.items():
+            with self.subTest(name):
+                default = self.sql(setup + query + ' ORDER BY ALL;')
+                self.assertEqual(len(default), count)
+                self.assertEqual(self.sql(setup + query + ' ORDER BY ALL;', "SET jevdb_optimizer_mode='late';"),
+                                 default)
+        # (0,0) holds by its note, odd reports by their text.
+        self.assertEqual(self.sql(setup + cases['an ordinary join above'][0] + ' ORDER BY ALL;',
+                                  "SET jevdb_optimizer_mode='late';"), ['0,0', '5,47', '19,47'])
+
     def test_ordinary_joins_restrict_semantic_inputs_before_judging(self):
         setup = """
             CREATE TABLE rep AS SELECT i AS id, CASE WHEN i % 3 = 0 THEN 'good report ' ELSE 'report ' END || i AS text,

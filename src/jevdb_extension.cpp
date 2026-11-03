@@ -8,6 +8,8 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -835,6 +837,74 @@ static void DeferDecisionAfterTopN(unique_ptr<LogicalOperator> &op) {
 	}
 }
 
+// The projection maps of an operator, each with the child it selects from.
+static vector<std::pair<vector<idx_t> *, idx_t>> ProjectionMaps(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return {{&op.Cast<LogicalFilter>().projection_map, 0}};
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+		return {{&op.Cast<LogicalOrder>().projection_map, 0}};
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN: {
+		auto &join = op.Cast<LogicalJoin>();
+		return {{&join.left_projection_map, 0}, {&join.right_projection_map, 1}};
+	}
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
+		if (auto filter = dynamic_cast<LogicalSemanticFilter *>(&op))
+			return {{&filter->projection_map, 0}};
+		if (auto join = dynamic_cast<LogicalSemanticJoin *>(&op))
+			return {{&join->left_projection_map, 0}, {&join->right_projection_map, 1}};
+		return {};
+	default:
+		return {};
+	}
+}
+
+// DuckDB's join ordering keeps the operators above a region it reorders and the non-reorderable joins around it, but
+// rebuilds the region, so its output columns come in another order. Their projection maps, set by DuckDB's column
+// lifetime pass before this late ordering, select by position; they are recorded here as the columns they select
+// and mapped again afterwards. The rebuilt joins themselves have no maps and keep every column.
+using SelectedColumns = std::unordered_map<LogicalOperator *, vector<vector<ColumnBinding>>>;
+
+static void RecordProjectionMaps(LogicalOperator &op, SelectedColumns &selected) {
+	for (auto &map : ProjectionMaps(op)) {
+		auto bindings = op.children[map.second]->GetColumnBindings();
+		vector<ColumnBinding> columns;
+		for (auto index : *map.first)
+			columns.push_back(bindings[index]);
+		selected[&op].push_back(std::move(columns));
+	}
+	for (auto &child : op.children)
+		RecordProjectionMaps(*child, selected);
+}
+
+// Only operators that kept their maps are looked up: the ordering creates operators without them.
+static void RestoreProjectionMaps(LogicalOperator &op, const SelectedColumns &selected) {
+	for (auto &child : op.children)
+		RestoreProjectionMaps(*child, selected);
+	auto maps = ProjectionMaps(op);
+	auto entry = selected.find(&op);
+	if (entry == selected.end() || entry->second.size() != maps.size())
+		return;
+	for (idx_t i = 0; i < maps.size(); i++) {
+		auto &map = *maps[i].first;
+		if (map.empty())
+			continue;
+		auto bindings = op.children[maps[i].second]->GetColumnBindings();
+		vector<idx_t> restored;
+		for (auto &column : entry->second[i]) {
+			auto position = std::find(bindings.begin(), bindings.end(), column);
+			if (position == bindings.end())
+				return;
+			restored.push_back(NumericCast<idx_t>(position - bindings.begin()));
+		}
+		map = std::move(restored);
+	}
+	op.ResolveOperatorTypes();
+}
+
 static void PreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	if (StringValue::Get(Setting(input.context, "jevdb_optimizer_mode")) == "early") {
 		WrapJoins(plan);
@@ -852,8 +922,11 @@ static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 		WrapJoins(plan);
 	}
 	if (strategy == "late") {
+		SelectedColumns selected;
+		RecordProjectionMaps(*plan, selected);
 		JoinOrderOptimizer order(input.context);
 		plan = order.Optimize(std::move(plan));
+		RestoreProjectionMaps(*plan, selected);
 	}
 	DeferDecisionAfterTopN(plan);
 }
