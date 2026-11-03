@@ -384,6 +384,44 @@ class ReleaseBehavior(unittest.TestCase):
         self.assertIn('JEV_SEMANTIC_FILTER', plan)
         self.assertEqual(self.server.entries, [])  # EXPLAIN sends no request
 
+    def test_correlated_subquery_argument_in_a_join_condition_matches_the_cte_form(self):
+        setup = """
+            CREATE TABLE i AS SELECT * FROM (VALUES (1,'report one'),(2,'report two'),(3,'report three')) v(id,text);
+            CREATE TABLE l AS SELECT * FROM (VALUES (10,'entry x'),(20,'entry y')) v(id,text);
+            CREATE TABLE a AS SELECT * FROM (VALUES (1,NULL,'good note'),(2,20,'good fix'),(2,10,'plain'),
+                (3,NULL,'plain')) v(incident,entry,note);
+            CREATE TABLE c AS SELECT * FROM (VALUES (1,10),(2,20),(3,10)) v(incident,entry);
+        """
+        notes = ("(SELECT coalesce(string_agg(a.note,';' ORDER BY a.note),'') FROM a "
+                 "WHERE a.incident=i.id AND (a.entry IS NULL OR a.entry=l.id))")
+        holds = "jev_holds('p',{})"
+        record = f"struct_pack(report:=i.text,entry:=l.text,notes:={notes})"
+        natural = f"SELECT i.id,l.id FROM i JOIN l ON {holds.format(record)}"
+        cte = (f"WITH e AS MATERIALIZED (SELECT i.id AS iid,l.id AS lid,{record} AS r FROM i, l) "
+               f"SELECT iid,lid FROM e WHERE {holds.format('r')}")
+
+        def judged():
+            records = []
+            for path, raw, auth, at in self.server.entries:
+                body = json.loads(raw)
+                for question in body['questions'].values():
+                    fields = {k: v for k, v in body['state'].items() if k != 'condition'}
+                    if isinstance(question['instructions'], dict):
+                        fields.update((k, v) for k, v in question['instructions'].items() if k != 'question')
+                    records.append(json.dumps(fields, sort_keys=True))
+            return sorted(records)
+
+        outputs = {}
+        for name, query in (('natural', natural), ('cte', cte)):
+            self.server.entries.clear()
+            outputs[name] = (self.sql(setup + query + ' ORDER BY ALL;'), judged())
+        # Each pair is judged on the notes of its incident that are general or name its entry.
+        self.assertEqual(outputs['natural'][0], ['1,10', '1,20', '2,20'])
+        self.assertEqual(outputs['natural'], outputs['cte'])
+        self.assertEqual(len(outputs['natural'][1]), 6)
+        candidates = ' JOIN c ON c.incident=i.id AND c.entry=l.id ORDER BY ALL;'
+        self.assertEqual(self.sql(setup + natural + candidates), ['1,10', '2,20'])
+
     def test_ordinary_joins_restrict_semantic_inputs_before_judging(self):
         setup = """
             CREATE TABLE rep AS SELECT i AS id, CASE WHEN i % 3 = 0 THEN 'good report ' ELSE 'report ' END || i AS text,

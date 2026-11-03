@@ -654,10 +654,8 @@ static void ExecuteDecision(DataChunk &input, ExpressionState &expression_state,
 static ScalarFunction DecisionFunction(DecisionMode mode);
 
 static unique_ptr<Expression> BindDecisionExpression(FunctionBindExpressionInput &input) {
-	vector<unique_ptr<Expression>> children;
-	for (auto &child : input.children) {
-		children.push_back(child->Copy());
-	}
+	// Move the arguments: a subquery argument cannot be copied while it is still unplanned.
+	auto children = std::move(input.children);
 	auto &data = input.bind_data->Cast<HoldsData>();
 	auto function = DecisionFunction(data.mode);
 	function.arguments = data.argument_types;
