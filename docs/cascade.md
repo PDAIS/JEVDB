@@ -29,8 +29,10 @@ Projection-only calls use fixed bounds. NULL input values produce SQL NULL and
 are not judged. Duplicate inputs share their probability and second-stage answer,
 while duplicate SQL result rows are retained.
 
-The second stage requests one Boolean per item in a strict JSON Schema.
-Missing, invalid or short answers abort the query. Transient request failures use
+The second stage requests one answer per item in a strict JSON Schema. By default
+each answer names its item, `{"id":0,"verdict":true}`, with integer ids from `0` to
+the request's item count minus one; every id must appear exactly once. `SET jevdb_cascade_numbered=false` restores
+the Boolean array. Missing, invalid, duplicate or short answers abort the query. Transient request failures use
 the [retry settings](settings.md); the default exhausted-request behavior is an
 error. `jev_probability`, `jev_choose` and `jev_score` use the first stage only.
 Custom first-stage scorers can also feed this cascade; see [Scorers](scorers.md).

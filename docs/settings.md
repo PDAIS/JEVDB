@@ -42,6 +42,7 @@ CREATE SECRET llm (TYPE openai, PROVIDER env); -- OPENAI_API_KEY
 | `jevdb_cascade_batch_size` | 16 | Maximum second-stage judgments per request |
 | `jevdb_cascade_threads` | 8 | Concurrent second-stage workers |
 | `jevdb_cascade_fill_batches` | true | Fill batches; false spreads small pools across workers |
+| `jevdb_cascade_numbered` | true | Second-stage answers name their item with an integer id (`{"id":0,"verdict":true}`); false returns a Boolean array in item order |
 | `jevdb_cascade_timeout` | 120 | Second-stage read/write timeout, seconds |
 | `jevdb_cascade_ca_cert_file` | empty | Second-stage HTTPS CA file |
 

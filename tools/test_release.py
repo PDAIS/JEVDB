@@ -59,7 +59,9 @@ class Handler(BaseHTTPRequestHandler):
             answers = []
             for item in payload['items']:
                 text = item.get('left', '') + item.get('right', '') + ' '.join(f['value'] for f in item.get('fields', []))
-                if schema['type'] == 'string':
+                if schema['type'] == 'object':
+                    answers.append({'id': item['id'], 'verdict': 'good' in text})
+                elif schema['type'] == 'string':
                     answers.append(next((v for v in schema['enum'] if v in text), schema['enum'][-1]))
                 elif schema['type'] == 'boolean':
                     answers.append('good' in text)
@@ -67,6 +69,18 @@ class Handler(BaseHTTPRequestHandler):
                     answers.append(min(text.count('!'), schema['maximum']))
                 else:
                     answers.append(.9 if 'good' in text else .1)
+            if schema['type'] == 'object':
+                answers.reverse()  # numbered answers arrive out of order; ids carry the mapping
+                if self.server.invalid == 'duplicate':
+                    answers = [answers[0]] * len(answers)
+                elif self.server.invalid == 'unknown':
+                    answers[0] = {'id': len(answers), 'verdict': True}
+                elif self.server.invalid in ('negative', 'string', 'legacy_string', 'boolean', 'fractional', 'null'):
+                    invalid_ids = {'negative': -1, 'string': '0', 'legacy_string': 'p0',
+                                   'boolean': True, 'fractional': 0.5, 'null': None}
+                    answers[0]['id'] = invalid_ids[self.server.invalid]
+                elif self.server.invalid == 'missing_id':
+                    del answers[0]['id']
             if self.server.invalid == 'length':
                 answers = answers[:-1]
             elif self.server.invalid == 'range':
@@ -274,6 +288,36 @@ class ReleaseBehavior(unittest.TestCase):
         self.assertEqual(rows, ['true', '1,1,1,1'])
         self.assertEqual(self.server.entries[0][1], self.server.entries[1][1])
         self.assertEqual(self.server.entries[2][1], self.server.entries[3][1])
+
+    def test_numbered_cascade_answers_map_by_id(self):
+        query = ("SELECT r.id FROM (VALUES (1,'good a'),(2,'b'),(3,'good c'),(4,'d'),(5,'e'),(6,'good f')) r(id,text) "
+                 "WHERE jev_holds('p',r.text) ORDER BY 1; SELECT cascade_items FROM jevdb_stats();")
+        settings = (f"SET jevdb_cascade_model='local-boolean'; SET jevdb_cascade_endpoint={literal(self.endpoint)}; "
+                    "SET jevdb_cascade_low=0; SET jevdb_cascade_high=1; SET jevdb_cascade_threads=1; "
+                    "SET jevdb_cascade_batch_size=4;")
+        plain = self.sql(query, settings + 'SET jevdb_cascade_numbered=false;')
+        self.server.entries.clear()
+        numbered = self.sql(query, settings + 'SET jevdb_cascade_numbered=true;')
+        self.assertEqual(numbered, plain)
+        self.assertEqual(numbered, ['1', '3', '6', '6'])
+        bodies = [json.loads(raw) for path, raw, auth, at in self.server.entries if path.endswith('/chat/completions')]
+        self.assertEqual(sorted(len(json.loads(body['messages'][1]['content'])['items']) for body in bodies), [2, 4])
+        for body in bodies:
+            inputs = json.loads(body['messages'][1]['content'])['items']
+            ids = [item['id'] for item in inputs]
+            self.assertEqual(ids, list(range(len(inputs))))
+            self.assertTrue(all(type(item_id) is int for item_id in ids))
+            item = body['response_format']['json_schema']['schema']['properties']['answers']['items']
+            self.assertEqual(item['required'], ['id', 'verdict'])
+            self.assertEqual(item['properties']['id'], {'type': 'integer', 'enum': ids})
+        for failure in ('duplicate', 'unknown', 'negative', 'string', 'legacy_string', 'boolean', 'fractional',
+                        'null', 'missing_id'):
+            with self.subTest(failure):
+                self.server.invalid = failure
+                result = self.execute(query, settings + 'SET jevdb_cascade_numbered=true;')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('must name a distinct integer item id', result.stderr)
+        self.server.invalid = None
 
     def test_llm_invalid_answer_fails_and_budget_splits_batches(self):
         settings = "SET jevdb_backend='llm'; SET jevdb_model='local-decisions';"

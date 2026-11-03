@@ -282,6 +282,7 @@ static bool OptionName(const string &name) {
 	                                       "cascade_precision_loss",
 	                                       "cascade_batch_size",
 	                                       "cascade_fill_batches",
+	                                       "cascade_numbered",
 	                                       "cascade_threads",
 	                                       "cascade_timeout",
 	                                       "cascade_ca_cert_file"};
@@ -366,6 +367,8 @@ static void SetOption(ClientContext &context, Config &config, const string &name
 		config.cascade.threads = UBigIntValue::Get(value.CastAs(context, LogicalType::UBIGINT));
 	else if (name == "cascade_fill_batches")
 		config.cascade.fill_batches = BooleanValue::Get(value.CastAs(context, LogicalType::BOOLEAN));
+	else if (name == "cascade_numbered")
+		config.cascade.numbered = BooleanValue::Get(value.CastAs(context, LogicalType::BOOLEAN));
 	else if (name == "cascade_timeout")
 		config.cascade.timeout = DoubleValue::Get(value.CastAs(context, LogicalType::DOUBLE));
 	else if (name == "cascade_ca_cert_file")
@@ -493,6 +496,7 @@ static unique_ptr<FunctionData> BindDecision(ClientContext &context, ScalarFunct
 	                  "cascade_precision_loss",
 	                  "cascade_batch_size",
 	                  "cascade_fill_batches",
+	                  "cascade_numbered",
 	                  "cascade_threads",
 	                  "cascade_timeout",
 	                  "cascade_ca_cert_file"}) {
@@ -921,6 +925,9 @@ static void Load(ExtensionLoader &loader) {
 	config.AddExtensionOption("jevdb_cascade_batch_size", "Maximum second-stage judgments per request",
 	                          LogicalType::UBIGINT, Value::UBIGINT(16));
 	config.AddExtensionOption("jevdb_cascade_fill_batches", "Fill second-stage batches before dispatch",
+	                          LogicalType::BOOLEAN, Value(true));
+	config.AddExtensionOption("jevdb_cascade_numbered",
+	                          "Second-stage answers carry their item id instead of relying on array order",
 	                          LogicalType::BOOLEAN, Value(true));
 	config.AddExtensionOption("jevdb_cascade_threads", "Concurrent second-stage request workers", LogicalType::UBIGINT,
 	                          Value::UBIGINT(8));

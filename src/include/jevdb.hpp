@@ -51,6 +51,8 @@ struct CascadeConfig {
 	idx_t batch_size = 16;
 	idx_t threads = 8;
 	bool fill_batches = true;
+	// Second-stage answers name their item ({"id":0,"verdict":true}) instead of relying on array order.
+	bool numbered = true;
 	double timeout = 120;
 	bool Enabled() const {
 		return !model.empty();
@@ -58,10 +60,11 @@ struct CascadeConfig {
 	bool operator==(const CascadeConfig &other) const {
 		return retry == other.retry &&
 		       std::tie(endpoint, model, api_key, ca_cert_file, low, high, calibrate, recall_loss, precision_loss,
-		                batch_size, threads, fill_batches,
+		                batch_size, threads, fill_batches, numbered,
 		                timeout) == std::tie(other.endpoint, other.model, other.api_key, other.ca_cert_file, other.low,
 		                                     other.high, other.calibrate, other.recall_loss, other.precision_loss,
-		                                     other.batch_size, other.threads, other.fill_batches, other.timeout);
+		                                     other.batch_size, other.threads, other.fill_batches, other.numbered,
+		                                     other.timeout);
 	}
 };
 
@@ -91,7 +94,7 @@ using CacheIdentity = std::tuple<string, string, string, QuestionKind, string, s
 using ConnectionIdentity = std::tuple<string, string, string, idx_t, double, idx_t, double, double>;
 using JevScheduleIdentity = std::tuple<string, string, idx_t, double, double, double, idx_t, bool>;
 using CascadeIdentity = std::tuple<CacheIdentity, bool, vector<string>, vector<string>, JevScheduleIdentity, string,
-                                   string, double, double, idx_t, double, double, idx_t, idx_t, bool, double>;
+                                   string, double, double, idx_t, double, double, idx_t, idx_t, bool, bool, double>;
 struct AnswerCache {
 	std::map<Pair, double> pair_scores;
 	std::map<Record, double> record_scores;
@@ -196,7 +199,7 @@ struct HoldsData : FunctionData {
 		return std::make_tuple(Identity(), pairwise, left_fields, right_fields, jev_schedule, cascade.endpoint,
 		                       cascade.model, cascade.low, cascade.high, cascade.calibrate, cascade.recall_loss,
 		                       cascade.precision_loss, cascade.batch_size, cascade.threads, cascade.fill_batches,
-		                       cascade.timeout);
+		                       cascade.numbered, cascade.timeout);
 	}
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
