@@ -9,6 +9,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
+#include <map>
 #include <set>
 
 namespace duckdb {
@@ -75,6 +76,17 @@ struct ReplayState : GlobalSourceState {
 	idx_t indexed_position = 0;
 	bool indexed_more = false;
 	bool indexed_done = false;
+	// The replay of a calibrated join has a probe chunk in rows whose product is being enumerated.
+	bool have_left = false;
+	bool left_done = false;
+	// The current product block's decisions, the position in it, the candidates of the current 2048-candidate block
+	// and its accepted rows.
+	vector<bool> block_valid;
+	vector<bool> block_accepted;
+	idx_t block_position = 0;
+	idx_t block_size = 0;
+	idx_t block_candidates = 0;
+	unique_ptr<DataChunk> block_rows;
 };
 
 static void ReadSavedValues(DataChunk &rows, DataChunk &values, idx_t offset) {
@@ -345,6 +357,43 @@ struct JoinSink : GlobalSinkState {
 	std::mutex probe_mutex;
 };
 
+// Distinct model inputs of one probe chunk in first-seen order, with the candidate rows carrying each.
+struct DistinctInputs {
+	vector<Pair> pairs;
+	vector<Record> records;
+	vector<idx_t> rows;
+	std::map<Pair, idx_t> pair_ids;
+	std::map<Record, idx_t> record_ids;
+	void Clear() {
+		pairs.clear();
+		records.clear();
+		rows.clear();
+		pair_ids.clear();
+		record_ids.clear();
+	}
+	idx_t Add(HoldsData &data, Pair pair, Record record) {
+		if (data.pairwise) {
+			auto entry = pair_ids.emplace(pair, pairs.size());
+			if (entry.second) {
+				pairs.push_back(std::move(pair));
+				rows.push_back(0);
+			}
+			rows[entry.first->second]++;
+			return entry.first->second;
+		}
+		auto entry = record_ids.emplace(record, records.size());
+		if (entry.second) {
+			records.push_back(std::move(record));
+			rows.push_back(0);
+		}
+		rows[entry.first->second]++;
+		return entry.first->second;
+	}
+	bool Accepted(HoldsData &data, idx_t item) const {
+		return data.pairwise ? Matches(data, pairs[item]) : RecordMatches(data, records[item]);
+	}
+};
+
 struct JoinState : CachingOperatorState {
 	JoinState(ExecutionContext &context, ColumnDataCollection &right, const BoundFunctionExpression &holds,
 	          optional_ptr<const Expression> ordinary, const vector<LogicalType> &types)
@@ -412,6 +461,13 @@ struct JoinState : CachingOperatorState {
 	vector<vector<Value>> rows;
 	idx_t position = 0;
 	bool gathered = false;
+	SelectionVector selection {STANDARD_VECTOR_SIZE};
+	// Distinct model inputs of the current probe chunk, and whether its accepted rows are being emitted.
+	DistinctInputs items;
+	bool emitting = false;
+	// Accepted rows of the current input chunk not yet emitted, and whether its candidates are all enumerated.
+	unique_ptr<DataChunk> carry;
+	bool exhausted = false;
 };
 
 class PhysicalSemanticJoin : public PhysicalJoin {
@@ -547,7 +603,7 @@ public:
 					if (!found)
 						continue;
 				}
-				auto result = Probe(state.indexed_input, output, state.indexed_state->Cast<JoinState>());
+				auto result = ProbeKeyed(state.indexed_input, output, state.indexed_state->Cast<JoinState>());
 				state.indexed_more = result == OperatorResultType::HAVE_MORE_OUTPUT;
 				if (output.size())
 					return SourceResultType::HAVE_MORE_OUTPUT;
@@ -556,59 +612,103 @@ public:
 		if (!global_calibration)
 			return SourceResultType::FINISHED;
 		auto &saved = *sink.deferred;
-		const idx_t value_offset = join_type == JoinType::INNER ? types.size() : 0;
 		if (!state.initialized) {
 			FinishDecisions(data, saved.pairs, saved.records);
-			saved.rows.InitializeScan(state.scan);
-			saved.rows.InitializeScanChunk(state.rows);
-			state.values.Initialize(Allocator::DefaultAllocator(), InputTypes(*holds));
+			// The probe rows were kept; their candidates are enumerated again against the build rows.
+			state.indexed_state = GetOperatorState(context);
+			sink.left->InitializeScan(state.scan);
+			sink.left->InitializeScanChunk(state.rows);
 			if (join_type != JoinType::INNER) {
-				state.matched.resize(sink.left->Count(), false);
-				while (saved.rows.Scan(state.scan, state.rows)) {
-					ReadSavedValues(state.rows, state.values, value_offset);
-					for (idx_t row = 0; row < state.rows.size(); row++) {
-						Pair pair;
-						Record record;
-						ReadDecision(data, state.values, row, pair, record);
-						if (DecisionMatches(data, pair, record)) {
-							auto left_row = state.rows.GetValue(state.rows.ColumnCount() - 1, row).GetValue<idx_t>();
-							state.matched[left_row] = true;
+				auto &replay = state.indexed_state->Cast<JoinState>();
+				state.matched.assign(sink.left->Count(), false);
+				idx_t base = 0;
+				vector<idx_t> left;
+				idx_t count = 0;
+				while (sink.left->Scan(state.scan, state.rows)) {
+					while (sink.right.Count() && NextCandidates(replay, state.rows, left, count)) {
+						for (idx_t row = 0; row < count; row++) {
+							Pair pair;
+							Record record;
+							if (ReadDecision(data, replay.values, row, pair, record) && DecisionMatches(data, pair, record))
+								state.matched[base + left[row]] = true;
 						}
 					}
+					base += state.rows.size();
 				}
 				sink.left->InitializeScan(state.scan);
-				state.rows.Destroy();
-				sink.left->InitializeScanChunk(state.rows);
 			}
 			state.initialized = true;
 		}
 		SelectionVector selected(STANDARD_VECTOR_SIZE);
-		while ((join_type == JoinType::INNER ? saved.rows : *sink.left).Scan(state.scan, state.rows)) {
-			idx_t found = 0;
-			if (join_type == JoinType::INNER) {
-				ReadSavedValues(state.rows, state.values, value_offset);
-				for (idx_t row = 0; row < state.rows.size(); row++) {
-					Pair pair;
-					Record record;
-					ReadDecision(data, state.values, row, pair, record);
-					if (DecisionMatches(data, pair, record))
-						selected.set_index(found++, row);
+		if (join_type == JoinType::INNER) {
+			// The candidates were kept 2048 to a block and each block's accepted rows emitted together; the replay
+			// groups the accepted rows the same way, so the operators above see the same chunks.
+			auto &replay = state.indexed_state->Cast<JoinState>();
+			if (!state.block_rows) {
+				state.block_rows = make_uniq<DataChunk>();
+				state.block_rows->Initialize(Allocator::DefaultAllocator(), types);
+			}
+			auto &block = *state.block_rows;
+			vector<idx_t> left;
+			while (true) {
+				if (state.block_position == state.block_size) {
+					if (!state.have_left) {
+						if (state.left_done || !sink.left->Scan(state.scan, state.rows)) {
+							state.left_done = true;
+							if (block.size() == 0)
+								return SourceResultType::FINISHED;
+							output.Reset();
+							output.Append(block);
+							block.Reset();
+							return SourceResultType::HAVE_MORE_OUTPUT;
+						}
+						state.have_left = true;
+					}
+					idx_t count = 0;
+					if (!sink.right.Count() || !NextCandidates(replay, state.rows, left, count)) {
+						state.have_left = false;
+						continue;
+					}
+					Decisions(replay, count, state.block_valid, state.block_accepted);
+					state.block_position = 0;
+					state.block_size = count;
 				}
-			} else {
-				for (idx_t row = 0; row < state.rows.size(); row++) {
-					if (state.matched[state.left_position + row] == (join_type == JoinType::SEMI)) {
-						selected.set_index(found++, row);
+				SelectionVector sel(STANDARD_VECTOR_SIZE);
+				idx_t found = 0;
+				bool full = false;
+				while (state.block_position < state.block_size && !full) {
+					auto row = state.block_position++;
+					if (!state.block_valid[row])
+						continue;
+					if (state.block_accepted[row])
+						sel.set_index(found++, row);
+					full = ++state.block_candidates == STANDARD_VECTOR_SIZE;
+				}
+				if (found)
+					AppendRows(replay, sel, found, block);
+				if (full) {
+					state.block_candidates = 0;
+					if (block.size()) {
+						output.Reset();
+						output.Append(block);
+						block.Reset();
+						return SourceResultType::HAVE_MORE_OUTPUT;
 					}
 				}
-				state.left_position += state.rows.size();
 			}
+		}
+		while (sink.left->Scan(state.scan, state.rows)) {
+			idx_t found = 0;
+			for (idx_t row = 0; row < state.rows.size(); row++) {
+				if (state.matched[state.left_position + row] == (join_type == JoinType::SEMI))
+					selected.set_index(found++, row);
+			}
+			state.left_position += state.rows.size();
 			if (!found)
 				continue;
 			output.SetCardinality(state.rows.size());
-			for (idx_t column = 0; column < output.ColumnCount(); column++) {
-				output.data[column].Reference(
-				    state.rows.data[join_type == JoinType::INNER ? column : output_columns[column]]);
-			}
+			for (idx_t column = 0; column < output.ColumnCount(); column++)
+				output.data[column].Reference(state.rows.data[output_columns[column]]);
 			output.Slice(selected, found);
 			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
@@ -627,6 +727,63 @@ protected:
 		return Probe(input, output, operator_state.Cast<JoinState>());
 	}
 
+	// One step of candidate generation: the next block of the cross product of input with the build rows, after the
+	// ordinary conjuncts, with the model inputs evaluated into state.values. left gets the input row of each kept
+	// row. False once the product of this input is exhausted.
+	bool NextCandidates(JoinState &state, DataChunk &input, vector<idx_t> &left, idx_t &count,
+	                    idx_t *enumerated = nullptr) const {
+		state.product.Reset();
+		if (state.cross_product.Execute(input, state.product) == OperatorResultType::NEED_MORE_INPUT)
+			return false;
+		count = state.product.size();
+		if (enumerated)
+			*enumerated += count;
+		SelectionVector &selection = state.selection;
+		if (ordinary) {
+			count = state.ordinary_executor.SelectExpression(state.product, selection);
+		} else {
+			for (idx_t i = 0; i < count; i++)
+				selection.set_index(i, i);
+		}
+		left.resize(count);
+		for (idx_t i = 0; i < count; i++)
+			left[i] = state.cross_product.ScanLHS() ? state.cross_product.PositionInChunk() : selection.get_index(i);
+		state.product.Slice(selection, count);
+		state.values.Reset();
+		state.arguments.Execute(state.product, state.values);
+		return true;
+	}
+
+	// Per row of the current product block: whether it is a candidate (its model inputs are present) and accepted.
+	void Decisions(JoinState &state, idx_t count, vector<bool> &valid, vector<bool> &accepted) const {
+		auto &data = holds->bind_info->Cast<HoldsData>();
+		valid.assign(count, false);
+		accepted.assign(count, false);
+		for (idx_t row = 0; row < count; row++) {
+			Pair pair;
+			Record record;
+			if (!ReadDecision(data, state.values, row, pair, record))
+				continue;
+			valid[row] = true;
+			accepted[row] = DecisionMatches(data, pair, record);
+		}
+	}
+
+	// Appends the output columns of the product rows selected by sel to rows.
+	void AppendRows(JoinState &state, const SelectionVector &sel, idx_t found, DataChunk &rows) const {
+		DataChunk selected;
+		selected.InitializeEmpty(types);
+		selected.SetCardinality(state.product.size());
+		for (idx_t column = 0; column < types.size(); column++)
+			selected.data[column].Reference(state.product.data[output_columns[column]]);
+		selected.Slice(sel, found);
+		rows.Append(selected, true);
+	}
+
+	// The cross product with the build rows is enumerated twice per probe chunk: first to collect the distinct model
+	// inputs (each pair once, with the rows carrying it) and judge them, then to emit the accepted rows. No candidate
+	// row is kept in between, so memory follows the distinct inputs, not the product. Under automatic calibration the
+	// probe rows are kept instead and the second enumeration runs in GetData once the pool is complete.
 	OperatorResultType Probe(DataChunk &input, DataChunk &output, JoinState &state) const {
 		auto &data = holds->bind_info->Cast<HoldsData>();
 		auto &sink = sink_state->Cast<JoinSink>();
@@ -636,29 +793,149 @@ protected:
 		std::unique_lock<std::mutex> probe(sink.probe_mutex, std::defer_lock);
 		if (global_calibration)
 			probe.lock();
-		idx_t left_base = 0;
-		if (global_calibration && keys.empty()) {
-			left_base = sink.left->Count();
-			sink.left->Append(input);
+		if (!state.emitting) {
+			if (global_calibration)
+				sink.left->Append(input);
+			state.items.Clear();
+			vector<bool> matched;
+			vector<std::pair<idx_t, idx_t>> left_items;
+			vector<idx_t> left;
+			idx_t count = 0, cross_pairs = 0;
+			while (sink.right.Count() && NextCandidates(state, input, left, count, &cross_pairs)) {
+				vector<Pair> chunk_pairs;
+				vector<Record> chunk_records;
+				for (idx_t row = 0; row < count; row++) {
+					Pair pair;
+					Record record;
+					if (!ReadDecision(data, state.values, row, pair, record))
+						continue;
+					if (!data.config.prefetch) {
+						if (data.pairwise)
+							chunk_pairs.push_back(pair);
+						else
+							chunk_records.push_back(record);
+					}
+					if (global_calibration)
+						sink.deferred->Add(data, pair, record);
+					auto item = state.items.Add(data, std::move(pair), std::move(record));
+					if (join_type != JoinType::INNER)
+						left_items.emplace_back(left[row], item);
+				}
+				if (!data.config.prefetch) {
+					if (data.pairwise)
+						Judge(data, chunk_pairs);
+					else
+						JudgeRecords(data, chunk_records);
+				}
+			}
+			{
+				std::lock_guard<std::mutex> guard(data.state->mutex);
+				data.state->used = true;
+				data.state->stats.cross_product_pairs += cross_pairs;
+			}
+			// The clients count repeated inputs as cache hits; the candidates repeat each distinct input.
+			idx_t repeated = 0;
+			for (auto rows : state.items.rows)
+				repeated += rows - 1;
+			{
+				std::lock_guard<std::mutex> guard(data.state->mutex);
+				if (data.config.prefetch)
+					data.state->stats.cache_hits += repeated;
+				if (!global_calibration && UsesCascade(data))
+					data.state->stats.cascade_cache_hits += repeated;
+			}
+			if (data.config.prefetch) {
+				if (data.pairwise)
+					Judge(data, state.items.pairs);
+				else
+					JudgeRecords(data, state.items.records);
+			}
+			if (global_calibration)
+				return OperatorResultType::NEED_MORE_INPUT;
+			FinishDecisions(data, state.items.pairs, state.items.records);
+			if (join_type != JoinType::INNER) {
+				matched.assign(input.size(), false);
+				for (auto &entry : left_items) {
+					if (state.items.Accepted(data, entry.second))
+						matched[entry.first] = true;
+				}
+				SelectionVector selected(STANDARD_VECTOR_SIZE);
+				idx_t found = 0;
+				for (idx_t row = 0; row < input.size(); row++) {
+					if (matched[row] == (join_type == JoinType::SEMI))
+						selected.set_index(found++, row);
+				}
+				output.SetCardinality(input.size());
+				for (idx_t column = 0; column < output.ColumnCount(); column++)
+					output.data[column].Reference(input.data[output_columns[column]]);
+				output.Slice(selected, found);
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+			state.emitting = true;
 		}
+		// Second enumeration: the accepted rows of this input chunk in candidate order, emitted 2048 at a time as
+		// before (the operators above see the same chunks). At most one chunk plus one block is held.
+		if (!state.carry) {
+			state.carry = make_uniq<DataChunk>();
+			state.carry->Initialize(Allocator::DefaultAllocator(), types, 2 * STANDARD_VECTOR_SIZE);
+		}
+		auto &carry = *state.carry;
+		vector<idx_t> left;
+		vector<bool> valid, accepted;
+		SelectionVector sel(STANDARD_VECTOR_SIZE);
+		while (carry.size() < STANDARD_VECTOR_SIZE && !state.exhausted) {
+			idx_t count = 0;
+			if (!sink.right.Count() || !NextCandidates(state, input, left, count)) {
+				state.exhausted = true;
+				break;
+			}
+			Decisions(state, count, valid, accepted);
+			idx_t found = 0;
+			for (idx_t row = 0; row < count; row++) {
+				if (accepted[row])
+					sel.set_index(found++, row);
+			}
+			if (found)
+				AppendRows(state, sel, found, carry);
+		}
+		output.Reset();
+		if (carry.size() > STANDARD_VECTOR_SIZE || (carry.size() == STANDARD_VECTOR_SIZE && !state.exhausted)) {
+			SelectionVector head(STANDARD_VECTOR_SIZE);
+			for (idx_t row = 0; row < STANDARD_VECTOR_SIZE; row++)
+				head.set_index(row, row);
+			carry.Copy(output, head, STANDARD_VECTOR_SIZE);
+			DataChunk rest;
+			rest.Initialize(Allocator::DefaultAllocator(), types, 2 * STANDARD_VECTOR_SIZE);
+			carry.Copy(rest, STANDARD_VECTOR_SIZE);
+			carry.Reset();
+			carry.Append(rest, true);
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		}
+		if (carry.size()) {
+			output.Append(carry, true);
+			carry.Reset();
+		}
+		if (!state.exhausted)
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		state.exhausted = false;
+		state.emitting = false;
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	OperatorResultType ProbeKeyed(DataChunk &input, DataChunk &output, JoinState &state) const {
+		auto &data = holds->bind_info->Cast<HoldsData>();
+		auto &sink = sink_state->Cast<JoinSink>();
 		if (!state.gathered) {
 			vector<Pair> pairs;
 			vector<Record> records;
 			vector<vector<Value>> candidates;
 			vector<idx_t> left_indices;
 			SelectionVector selection(STANDARD_VECTOR_SIZE);
-			idx_t cross_pairs = 0;
 			if (sink.right.Count()) {
 				while (true) {
 					state.product.Reset();
-					if (!keys.empty()) {
-						if (!state.NextIndexed(input, sink.right, sink.index, keys[sink.key_choice].left))
-							break;
-					} else {
-						if (state.cross_product.Execute(input, state.product) == OperatorResultType::NEED_MORE_INPUT)
-							break;
-						cross_pairs += state.product.size();
-					}
+					if (!state.NextIndexed(input, sink.right, sink.index, keys[sink.key_choice].left))
+						break;
 					idx_t count = state.product.size();
 					if (ordinary) {
 						count = state.ordinary_executor.SelectExpression(state.product, selection);
@@ -670,17 +947,11 @@ protected:
 					// Evaluate ordinary and key predicates before collecting model inputs.
 					// Selection indices also identify the original probe-side row.
 					for (idx_t i = 0; i < count; i++) {
-						left_indices.push_back(!keys.empty() ? state.product_left[selection.get_index(i)]
-						                       : state.cross_product.ScanLHS() ? state.cross_product.PositionInChunk()
-						                                                       : selection.get_index(i));
+						left_indices.push_back(state.product_left[selection.get_index(i)]);
 					}
 					state.product.Slice(selection, count);
 					state.values.Reset();
 					state.arguments.Execute(state.product, state.values);
-					DataChunk deferred_rows;
-					idx_t deferred_count = 0;
-					if (global_calibration)
-						deferred_rows.Initialize(Allocator::DefaultAllocator(), deferred_types);
 					vector<Pair> chunk_pairs;
 					vector<Record> chunk_records;
 					for (idx_t row = 0; row < count; row++) {
@@ -688,47 +959,21 @@ protected:
 						Record record;
 						if (!ReadDecision(data, state.values, row, pair, record)) {
 							left_indices[left_indices.size() - count + row] = DConstants::INVALID_INDEX;
-						} else {
-							if (global_calibration) {
-								auto &saved = *sink.deferred;
-								saved.Add(data, pair, record);
-								idx_t column = 0;
-								if (join_type == JoinType::INNER) {
-									for (auto projected : output_columns) {
-										deferred_rows.SetValue(column++, deferred_count,
-										                       state.product.GetValue(projected, row));
-									}
-								}
-								for (idx_t argument = 0; argument < state.values.ColumnCount(); argument++) {
-									deferred_rows.SetValue(column++, deferred_count,
-									                       state.values.GetValue(argument, row));
-								}
-								deferred_rows.SetValue(
-								    column, deferred_count++,
-								    Value::UBIGINT(left_base + left_indices[left_indices.size() - count + row]));
-							}
-							if (!data.config.prefetch) {
-								if (data.pairwise)
-									chunk_pairs.push_back(pair);
-								else
-									chunk_records.push_back(record);
-							}
+						} else if (!data.config.prefetch) {
+							if (data.pairwise)
+								chunk_pairs.push_back(pair);
+							else
+								chunk_records.push_back(record);
 						}
 						pairs.push_back(std::move(pair));
 						records.push_back(std::move(record));
 						vector<Value> values;
-						if (join_type == JoinType::INNER && !global_calibration) {
-							// Retain projected output values only; model inputs already
-							// live in pairs/records. SEMI/ANTI need no pair copies.
-							for (auto column : output_columns) {
-								values.push_back(state.product.GetValue(column, row));
-							}
+						// Retain projected output values only; model inputs already
+						// live in pairs/records.
+						for (auto column : output_columns) {
+							values.push_back(state.product.GetValue(column, row));
 						}
 						candidates.push_back(std::move(values));
-					}
-					if (global_calibration && deferred_count) {
-						deferred_rows.SetCardinality(deferred_count);
-						sink.deferred->rows.Append(deferred_rows);
 					}
 					if (!data.config.prefetch) {
 						if (data.pairwise) {
@@ -743,12 +988,9 @@ protected:
 				std::lock_guard<std::mutex> guard(data.state->mutex);
 				data.state->used = true;
 				auto &stats = data.state->stats;
-				if (!keys.empty()) {
-					stats.index_posting_visits += state.posting_visits;
-					stats.index_candidate_pairs += state.candidate_pairs;
-					state.posting_visits = state.candidate_pairs = 0;
-				}
-				stats.cross_product_pairs += cross_pairs;
+				stats.index_posting_visits += state.posting_visits;
+				stats.index_candidate_pairs += state.candidate_pairs;
+				state.posting_visits = state.candidate_pairs = 0;
 			}
 			vector<Pair> requested;
 			vector<Record> requested_records;
@@ -768,27 +1010,10 @@ protected:
 					JudgeRecords(data, requested_records);
 				}
 			}
-			if (global_calibration)
-				return OperatorResultType::NEED_MORE_INPUT;
 			FinishDecisions(data, requested, requested_records);
-			vector<bool> matched(input.size(), false);
 			for (idx_t i = 0; i < pairs.size(); i++) {
 				if (left_indices[i] != DConstants::INVALID_INDEX && DecisionMatches(data, pairs[i], records[i])) {
-					matched[left_indices[i]] = true;
-					if (join_type == JoinType::INNER) {
-						state.rows.push_back(std::move(candidates[i]));
-					}
-				}
-			}
-			if (join_type == JoinType::SEMI || join_type == JoinType::ANTI) {
-				for (idx_t row = 0; row < input.size(); row++) {
-					if (matched[row] == (join_type == JoinType::SEMI)) {
-						vector<Value> values;
-						for (auto column : output_columns) {
-							values.push_back(input.GetValue(column, row));
-						}
-						state.rows.push_back(std::move(values));
-					}
+					state.rows.push_back(std::move(candidates[i]));
 				}
 			}
 			state.gathered = true;
