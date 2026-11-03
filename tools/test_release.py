@@ -506,6 +506,91 @@ class ReleaseBehavior(unittest.TestCase):
                 if expected is not None:
                     self.assertEqual(outputs['true'][1], expected)
 
+    def test_joins_reading_both_inputs_reduce_each_before_judging(self):
+        # ok names reports 0, 5 and 19 and plans 0 and 47, so DuckDB's min/max filters remove nothing; odd reports
+        # hold. (5,47) is listed twice; NULLs match only under IS NOT DISTINCT FROM.
+        setup = """
+            CREATE TABLE rep(id INT, text VARCHAR);
+            INSERT INTO rep SELECT i, CASE WHEN i % 2 = 1 THEN 'good report ' ELSE 'report ' END || i FROM range(20) t(i);
+            INSERT INTO rep VALUES (NULL, 'good report null');
+            CREATE TABLE pln(id INT, app VARCHAR);
+            INSERT INTO pln SELECT i, 'plan ' || i FROM range(48) t(i);
+            CREATE TABLE site(id INT, text VARCHAR);
+            INSERT INTO site SELECT i, CASE WHEN i = 0 THEN 'good site ' ELSE 'site ' END || i FROM range(3) t(i);
+            CREATE TABLE ok(report_id INT, plan_id INT, batch INT, site_id INT, note VARCHAR);
+            INSERT INTO ok VALUES (0,0,0,0,'good'),(0,47,1,2,'n'),(5,47,0,0,'n'),(5,47,0,0,'n'),(19,0,1,2,'n'),
+                (19,47,1,0,'n'),(NULL,0,0,2,'n'),(19,NULL,1,0,'n');
+            CREATE TABLE bat(id INT, open BOOLEAN);
+            INSERT INTO bat VALUES (0,true),(1,false);
+        """
+        pair = "FROM rep JOIN pln ON jev_holds('applies',rep.text,pln.app)"
+        both = "ok.report_id=rep.id AND ok.plan_id=pln.id"
+        # query, distinct pairs judged with the reduction (None: only compared with the run without it)
+        cases = {
+            'a join reading both inputs reduces each':
+                (f"SELECT rep.id,pln.id,ok.batch {pair} JOIN ok ON {both}", 3 * 2),
+            'the same written as a filter on each input':
+                (f"SELECT rep.id,pln.id,ok.batch {pair} JOIN ok ON {both} "
+                 "WHERE pln.id IN (SELECT plan_id FROM ok) AND rep.id IN (SELECT report_id FROM ok)", 3 * 2),
+            'IS NOT DISTINCT FROM keeps the NULL report':
+                (f"SELECT rep.id,pln.id {pair} JOIN ok ON ok.report_id IS NOT DISTINCT FROM rep.id "
+                 "AND ok.plan_id IS NOT DISTINCT FROM pln.id", 4 * 2),
+            'EXISTS on both inputs':
+                (f"SELECT rep.id,pln.id {pair} WHERE EXISTS (SELECT 1 FROM ok WHERE {both})", 3 * 2),
+            'a row IN on both inputs':
+                (f"SELECT rep.id,pln.id {pair} WHERE (rep.id,pln.id) IN (SELECT report_id,plan_id FROM ok)", 3 * 2),
+            'a condition reading one input still reduces it':
+                (f"SELECT rep.id,pln.id {pair} JOIN ok ON ok.report_id=rep.id AND ok.plan_id+rep.id=pln.id+rep.id",
+                 3 * 48),
+            'the relation reached through a further join':
+                (f"SELECT rep.id,pln.id,bat.id {pair} JOIN ok ON {both} JOIN bat ON bat.id=ok.batch WHERE bat.open",
+                 2 * 2),
+            'the relation reached through EXISTS':
+                (f"SELECT rep.id,pln.id {pair} JOIN ok ON {both} "
+                 "WHERE EXISTS (SELECT 1 FROM bat WHERE bat.id=ok.batch AND bat.open)", 2 * 2),
+            'the relation reached through NOT EXISTS':
+                (f"SELECT rep.id,pln.id {pair} JOIN ok ON {both} "
+                 "WHERE NOT EXISTS (SELECT 1 FROM bat WHERE bat.id=ok.batch AND bat.open)", 2 * 2),
+            'a grouped relation':
+                (f"SELECT rep.id,pln.id,g.n {pair} JOIN (SELECT report_id,plan_id,count(*) n FROM ok GROUP BY ALL) g "
+                 "ON g.report_id=rep.id AND g.plan_id=pln.id", 3 * 2),
+            # Reports and sites are inputs of different semantic joins; the reducers go to each, and the cheaper
+            # capability edge is still judged first: 2 plans x 2 sites, then 3 reports x the 2 plans accepted.
+            'a join reading inputs of two semantic joins':
+                (f"SELECT rep.id,pln.id,site.id {pair} JOIN site ON jev_holds('capable',pln.app,site.text) "
+                 f"JOIN ok ON {both} AND ok.site_id=site.id", 2 * 2 + 3 * 2),
+            'a condition reading both inputs in one expression reduces nothing':
+                (f"SELECT rep.id,pln.id {pair} JOIN ok ON ok.report_id+ok.plan_id=rep.id+pln.id", 21 * 48),
+            'a LEFT JOIN restricts nothing':
+                (f"SELECT rep.id,pln.id,ok.batch {pair} LEFT JOIN ok ON {both}", None),
+            # A relation evaluated again could differ (random) or would be judged again (a decision): no copy.
+            'a volatile relation is not copied':
+                (f"SELECT rep.id,pln.id {pair} JOIN (SELECT report_id,plan_id+(random()*0)::INT AS plan_id FROM ok) v "
+                 "ON v.report_id=rep.id AND v.plan_id=pln.id", None),
+            'a relation with a semantic decision is not copied':
+                (f"SELECT rep.id,pln.id {pair} JOIN (SELECT * FROM ok WHERE jev_holds('open',ok.note)) d "
+                 "ON d.report_id=rep.id AND d.plan_id=pln.id", None),
+        }
+        for name, (query, expected) in cases.items():
+            with self.subTest(name):
+                outputs = {}
+                for reduce in ('true', 'false'):
+                    rows = self.sql(setup + query + ' ORDER BY ALL; SELECT pairs,records FROM jevdb_stats();',
+                                    f'SET jevdb_reduce_inputs={reduce};')
+                    pairs, records = map(int, rows[-1].split(','))
+                    outputs[reduce] = (rows[:-1], pairs, records)
+                self.assertEqual(outputs['true'][0], outputs['false'][0])
+                self.assertEqual(outputs['true'][2], outputs['false'][2])
+                if expected is None:
+                    self.assertEqual(outputs['true'][1], outputs['false'][1])
+                else:
+                    self.assertEqual(outputs['true'][1], expected)
+                    self.assertLessEqual(outputs['true'][1], outputs['false'][1])
+        # Rows of the first case: odd reports hold, and (5,47) is listed twice.
+        rows = self.sql(setup + cases['a join reading both inputs reduces each'][0] + ' ORDER BY ALL;')
+        self.assertEqual(rows, ['5,47,0', '5,47,0', '19,0,1', '19,47,1'])
+
+
     def test_automatic_calibration_uses_materialized_distinct_pool_with_keys(self):
         rows = self.sql("""
             CREATE TABLE a AS SELECT * FROM (VALUES (1,'good',['x']),(2,'good',['x']),(3,'bad',['y'])) v(id,text,keys);

@@ -3,15 +3,20 @@
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include <algorithm>
+#include <array>
 #include <set>
 
 namespace duckdb {
@@ -56,6 +61,18 @@ static bool IsKeys(const Expression &expression) {
 	       expression.Cast<BoundFunctionExpression>().function.name == "jev_keys_overlap";
 }
 
+// Neither volatile nor a semantic decision of any mode, so evaluating it again gives the same value without a request.
+static bool Plain(const Expression &expression) {
+	if (expression.IsVolatile())
+		return false;
+	bool plain = true;
+	ExpressionIterator::VisitExpression<BoundFunctionExpression>(expression, [&](const BoundFunctionExpression &call) {
+		auto &name = call.function.name;
+		plain &= name != "jev_holds" && name != "jev_probability" && name != "jev_choose" && name != "jev_score";
+	});
+	return plain;
+}
+
 // An explicit key screen belongs to the same inputs when its two sides come
 // from the same relation aliases as the semantic inputs. Projection and CTE
 // aliases are traced below, rather than matching arbitrary keys in an ancestor.
@@ -94,6 +111,8 @@ private:
 	Lineage lineage;
 	std::map<idx_t, vector<Sources>> cte_sources;
 	vector<Fix> fixes;
+	// Ordinary joins whose reducers are in place, and the reducing semi-joins themselves.
+	std::set<const LogicalOperator *> reduced;
 
 	struct Region {
 		Region(bool safe = true, bool keyed_any = false, bool comparison_above_any = false)
@@ -231,7 +250,8 @@ private:
 	}
 
 	// A correlated EXISTS that planning could not turn into a plain join stays a duplicate-eliminating join; it
-	// restricts its left input like a SEMI or ANTI join and moves with its right side.
+	// restricts its left input like a SEMI or ANTI join and moves with its right side. RIGHT_SEMI and RIGHT_ANTI are
+	// SEMI and ANTI joins whose inputs planning swapped to build on the smaller one.
 	static bool OrdinaryJoin(LogicalOperator &op) {
 		if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
 		    op.type != LogicalOperatorType::LOGICAL_DELIM_JOIN)
@@ -240,7 +260,20 @@ private:
 		if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN)
 			return !join.delim_flipped && (join.join_type == JoinType::SEMI || join.join_type == JoinType::ANTI);
 		return join.join_type == JoinType::INNER || join.join_type == JoinType::SEMI ||
-		       join.join_type == JoinType::ANTI;
+		       join.join_type == JoinType::ANTI || join.join_type == JoinType::RIGHT_SEMI ||
+		       join.join_type == JoinType::RIGHT_ANTI;
+	}
+
+	// Whether an ordinary join returns the rows of this child with their columns: either child of an INNER join, the
+	// child a SEMI or ANTI join filters.
+	static bool Kept(const LogicalComparisonJoin &join, idx_t child) {
+		if (join.join_type == JoinType::RIGHT_SEMI || join.join_type == JoinType::RIGHT_ANTI)
+			return child == 1;
+		return join.join_type == JoinType::INNER || child == 0;
+	}
+
+	static bool Semi(const LogicalComparisonJoin &join) {
+		return join.join_type == JoinType::SEMI || join.join_type == JoinType::RIGHT_SEMI;
 	}
 
 	// The child of an ordinary join through which a semantic join is reached by ordinary joins only.
@@ -263,7 +296,7 @@ private:
 	// either way. Returns the semantic input, or INVALID_INDEX.
 	idx_t ReducedInput(LogicalOperator &ordinary, idx_t child, LogicalOperator &semantic) {
 		auto &join = ordinary.Cast<LogicalComparisonJoin>();
-		if ((join.join_type != JoinType::INNER && child != 0) || HasSemanticPredicate(*ordinary.children[1 - child]))
+		if (!Kept(join, child) || HasSemanticPredicate(*ordinary.children[1 - child]))
 			return DConstants::INVALID_INDEX;
 		unordered_set<idx_t> references;
 		for (auto &condition : join.conditions) {
@@ -291,12 +324,243 @@ private:
 		return uses_left ? 0 : 1;
 	}
 
+	// A relation that returns the same rows when evaluated again in the same query, so that a copy of it can reduce a
+	// semantic input: catalog tables and constant rows combined by deterministic operators, with no volatile
+	// expression, no semantic decision (a copy would be judged again) and no aggregate whose result depends on the
+	// order of its input. delim counts the duplicate-eliminating joins above that belong to the relation.
+	static bool Repeatable(LogicalOperator &op, idx_t delim = 0) {
+		switch (op.type) {
+		case LogicalOperatorType::LOGICAL_GET:
+			if (!op.Cast<LogicalGet>().GetTable())
+				return false;
+			break;
+		case LogicalOperatorType::LOGICAL_DELIM_GET:
+			if (delim == 0)
+				return false;
+			break;
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+			if (op.Cast<LogicalDistinct>().distinct_type != DistinctType::DISTINCT)
+				return false;
+			break;
+		case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+		case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+			if (op.Cast<LogicalComparisonJoin>().predicate)
+				return false;
+			break;
+		case LogicalOperatorType::LOGICAL_FILTER:
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+		case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		case LogicalOperatorType::LOGICAL_UNION:
+		case LogicalOperatorType::LOGICAL_EXCEPT:
+		case LogicalOperatorType::LOGICAL_INTERSECT:
+		case LogicalOperatorType::LOGICAL_CTE_REF:
+		case LogicalOperatorType::LOGICAL_CHUNK_GET:
+		case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+		case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+			break;
+		default:
+			return false;
+		}
+		bool repeatable = true;
+		LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expression) {
+			repeatable &= Plain(**expression);
+			if ((*expression)->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
+				auto &aggregate = (*expression)->Cast<BoundAggregateExpression>();
+				auto type = aggregate.return_type.id();
+				repeatable &= aggregate.function.order_dependent == AggregateOrderDependent::NOT_ORDER_DEPENDENT;
+				// A floating-point sum depends on the order of its terms.
+				repeatable &= (type != LogicalTypeId::FLOAT && type != LogicalTypeId::DOUBLE) ||
+				              aggregate.function.name == "min" || aggregate.function.name == "max";
+			}
+		});
+		for (idx_t child = 0; child < op.children.size() && repeatable; child++) {
+			auto below = delim;
+			if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN &&
+			    child == (op.Cast<LogicalComparisonJoin>().delim_flipped ? 0 : 1))
+				below++;
+			repeatable &= Repeatable(*op.children[child], below);
+		}
+		return repeatable;
+	}
+
+	static void InputTables(LogicalOperator &semantic, std::array<unordered_set<idx_t>, 2> &tables) {
+		for (idx_t side = 0; side < 2; side++)
+			LogicalJoin::GetTableReferences(*semantic.children[side], tables[side]);
+	}
+
+	// The conditions by which an ordinary join left above a semantic join reduces each semantic input: equality
+	// conditions whose semantic side reads that input alone (tables). The join must be INNER, or SEMI on the input
+	// it returns, and its other relation repeatable. Each row it returns pairs a row of that input with a row of the
+	// other relation on these conditions, so input rows without such a partner reach no output; a semi-join with
+	// the same comparison removes them before judging, NULLs included, and keeps the multiplicity of the others.
+	std::array<vector<idx_t>, 2> Reducer(LogicalOperator &ordinary, idx_t child,
+	                                     const std::array<unordered_set<idx_t>, 2> &tables) {
+		std::array<vector<idx_t>, 2> result;
+		if (ordinary.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || reduced.count(&ordinary))
+			return result;
+		auto &join = ordinary.Cast<LogicalComparisonJoin>();
+		if ((join.join_type != JoinType::INNER && !Semi(join)) || !Kept(join, child) ||
+		    !Repeatable(*join.children[1 - child]))
+			return result;
+		for (idx_t index = 0; index < join.conditions.size(); index++) {
+			auto &condition = join.conditions[index];
+			if ((condition.comparison != ExpressionType::COMPARE_EQUAL &&
+			     condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) ||
+			    !Plain(*condition.left) || !Plain(*condition.right))
+				continue;
+			unordered_set<idx_t> references;
+			LogicalJoin::GetExpressionBindings(child == 0 ? *condition.left : *condition.right, references);
+			for (idx_t side = 0; side < 2; side++) {
+				bool inside = !references.empty();
+				for (auto table : references)
+					inside &= tables[side].count(table) != 0;
+				if (inside)
+					result[side].push_back(index);
+			}
+		}
+		return result;
+	}
+
+	// The other relation of a reducing INNER join below (above: joins left above the semantic join, with their
+	// semantic side) when every condition of this join reads that relation alone on the semantic side. The join then
+	// moves into that relation: the relation reaches the semantic inputs through it already reduced, as in the inward
+	// pass, and the result does not change for the reasons given in ReducedInput.
+	unique_ptr<LogicalOperator> *ReducingRelation(LogicalOperator &ordinary, idx_t child,
+	                                              const vector<std::pair<LogicalComparisonJoin *, idx_t>> &above,
+	                                              const std::array<unordered_set<idx_t>, 2> &tables) {
+		auto &join = ordinary.Cast<LogicalComparisonJoin>();
+		if (above.empty() || !Kept(join, child) || join.predicate ||
+		    !Repeatable(*join.children[1 - child], ordinary.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ? 1 : 0))
+			return nullptr;
+		unordered_set<idx_t> references;
+		for (auto &condition : join.conditions) {
+			if (!Plain(*condition.left) || !Plain(*condition.right))
+				return nullptr;
+			LogicalJoin::GetExpressionBindings(child == 0 ? *condition.left : *condition.right, references);
+		}
+		for (auto &column : join.duplicate_eliminated_columns) {
+			if (!Plain(*column))
+				return nullptr;
+			LogicalJoin::GetExpressionBindings(*column, references);
+		}
+		if (references.empty())
+			return nullptr;
+		for (auto &entry : above) {
+			auto &below = *entry.first;
+			auto usable = Reducer(below, entry.second, tables);
+			if (below.join_type != JoinType::INNER || (usable[0].empty() && usable[1].empty()))
+				continue;
+			unordered_set<idx_t> relation;
+			LogicalJoin::GetTableReferences(*below.children[1 - entry.second], relation);
+			bool inside = true;
+			for (auto table : references)
+				inside &= relation.count(table) != 0;
+			if (inside)
+				return &below.children[1 - entry.second];
+		}
+		return nullptr;
+	}
+
+	static bool InnerSemanticJoin(LogicalOperator &op) {
+		return SemanticJoin(op) && op.Cast<LogicalAnyJoin>().join_type == JoinType::INNER;
+	}
+
+	// A projection that only passes columns through, as relational input reduction leaves between semantic joins.
+	static bool Rename(LogicalOperator &op) {
+		if (op.type != LogicalOperatorType::LOGICAL_PROJECTION || !InnerSemanticJoin(*op.children[0]))
+			return false;
+		for (auto &expression : op.expressions) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+			    expression->Cast<BoundColumnRefExpression>().depth != 0)
+				return false;
+		}
+		return true;
+	}
+
+	static bool Nested(LogicalOperator &op) {
+		return InnerSemanticJoin(op) || Rename(op);
+	}
+
+	// Where a reducer of a semantic input (slot) goes: as deep as the tables its conditions read (references) allow,
+	// through semantic joins. nullptr when that position lies between directly nested semantic joins: a reducer stays
+	// outside such a chain.
+	static unique_ptr<LogicalOperator> *Position(unique_ptr<LogicalOperator> &slot, const unordered_set<idx_t> &references,
+	                                             bool nested) {
+		if (SemanticJoin(*slot)) {
+			// Only the left input of a semantic SEMI or ANTI join is part of its output.
+			auto inner = InnerSemanticJoin(*slot);
+			for (idx_t child = 0; child < (inner ? idx_t(2) : idx_t(1)); child++) {
+				unordered_set<idx_t> below;
+				LogicalJoin::GetTableReferences(*slot->children[child], below);
+				bool inside = true;
+				for (auto table : references)
+					inside &= below.count(table) != 0;
+				if (inside)
+					return Position(slot->children[child], references, inner);
+			}
+		}
+		return nested && Nested(*slot) ? nullptr : &slot;
+	}
+
+	// Reduces each semantic input that an ordinary join left above reads alone in some conditions: the input is
+	// semi-joined with a copy of the join's other relation on those conditions, one semi-join per position they
+	// reach. The join itself stays above with all its conditions, so the result does not change (see Reducer).
+	// tables: the semantic inputs before any reducer, as a copy carries the table indexes of its original.
+	void AddReducers(LogicalComparisonJoin &join, idx_t child, LogicalAnyJoin &semantic,
+	                 const std::array<unordered_set<idx_t>, 2> &tables) {
+		auto usable = Reducer(join, child, tables);
+		reduced.insert(&join);
+		auto &relation = *join.children[1 - child];
+		for (idx_t side = 0; side < 2; side++) {
+			vector<std::pair<unique_ptr<LogicalOperator> *, unique_ptr<LogicalComparisonJoin>>> reducers;
+			for (auto index : usable[side]) {
+				auto &condition = join.conditions[index];
+				JoinCondition reduce;
+				reduce.comparison = condition.comparison; // = and IS NOT DISTINCT FROM are symmetric
+				reduce.left = (child == 0 ? condition.left : condition.right)->Copy();
+				reduce.right = (child == 0 ? condition.right : condition.left)->Copy();
+				unordered_set<idx_t> references;
+				LogicalJoin::GetExpressionBindings(*reduce.left, references);
+				auto slot = Position(semantic.children[side], references, semantic.join_type == JoinType::INNER);
+				if (!slot)
+					continue;
+				auto entry = std::find_if(reducers.begin(), reducers.end(),
+				                          [&](const decltype(reducers)::value_type &other) { return other.first == slot; });
+				if (entry == reducers.end()) {
+					reducers.emplace_back(slot, make_uniq<LogicalComparisonJoin>(JoinType::SEMI));
+					entry = reducers.end() - 1;
+				}
+				entry->second->conditions.push_back(std::move(reduce));
+			}
+			for (auto &entry : reducers) {
+				auto &slot = *entry.first;
+				auto &reducer = entry.second;
+				try {
+					reducer->children.push_back(relation.Copy(optimizer.context));
+				} catch (std::exception &) {
+					continue;
+				}
+				reducer->SetEstimatedCardinality(MinValue(slot->EstimateCardinality(optimizer.context),
+				                                          relation.EstimateCardinality(optimizer.context)));
+				reducer->children.insert(reducer->children.begin(), std::move(slot));
+				reduced.insert(reducer.get());
+				slot = std::move(reducer);
+			}
+		}
+	}
+
 	// Relational reduction of semantic inputs. Planning leaves a semantic join below the ordinary joins that follow
 	// it, so every row of its inputs is paired and judged before those joins discard rows. Here the ordinary joins
-	// directly above a semantic join move into the input they restrict, innermost first. The semantic join then
-	// receives only rows that still have partners in the relations behind that input, which is what the inward pass
-	// of Yannakakis' algorithm leaves at that relation. The output columns of the rewritten subtree are restored by
-	// a projection, as the operators above address them by position through their projection maps.
+	// directly above a semantic join move into the input they restrict, innermost first. A join that cannot move,
+	// such as one whose conditions read both inputs, stays above and reduces each input it reads by a semi-join with
+	// a copy of its other relation (AddReducers); joins above it that read only that relation move into it first
+	// (ReducingRelation). The semantic join then receives only rows that still have partners in the relations behind
+	// that input, which is what the inward pass of Yannakakis' algorithm leaves at that relation. The output columns
+	// of the rewritten subtree are restored by a projection, as the operators above address them by position through
+	// their projection maps.
 	void ReduceInputs(unique_ptr<LogicalOperator> &op) {
 		if (OrdinaryJoin(*op) && TowerChild(*op) != DConstants::INVALID_INDEX) {
 			vector<LogicalOperator *> tower;
@@ -306,7 +570,17 @@ private:
 				path.push_back(TowerChild(*current));
 			}
 			auto &lowest = *tower.back();
-			if (ReducedInput(lowest, path.back(), *lowest.children[path.back()]) != DConstants::INVALID_INDEX) {
+			auto reduces = ReducedInput(lowest, path.back(), *lowest.children[path.back()]) != DConstants::INVALID_INDEX;
+			if (!reduces) {
+				// Nothing moves, so the semantic inputs keep their tables.
+				std::array<unordered_set<idx_t>, 2> tables;
+				InputTables(*lowest.children[path.back()], tables);
+				for (idx_t level = 0; level < tower.size() && !reduces; level++) {
+					auto usable = Reducer(*tower[level], path[level], tables);
+					reduces = !usable[0].empty() || !usable[1].empty();
+				}
+			}
+			if (reduces) {
 				op->ResolveOperatorTypes();
 				auto bindings = op->GetColumnBindings();
 				auto types = op->types;
@@ -321,20 +595,34 @@ private:
 				auto &semantic = top->Cast<LogicalAnyJoin>();
 				semantic.left_projection_map.clear();
 				semantic.right_projection_map.clear();
+				vector<std::pair<LogicalComparisonJoin *, idx_t>> above;
+				std::array<unordered_set<idx_t>, 2> tables;
 				for (idx_t level = joins.size(); level-- > 0;) {
 					auto &join = joins[level]->Cast<LogicalComparisonJoin>();
 					join.left_projection_map.clear();
 					join.right_projection_map.clear();
-					auto side =
-					    top.get() == &semantic ? ReducedInput(join, path[level], semantic) : DConstants::INVALID_INDEX;
-					if (side == DConstants::INVALID_INDEX) {
-						join.children[path[level]] = std::move(top);
-						top = std::move(joins[level]);
-					} else {
-						join.children[path[level]] = std::move(semantic.children[side]);
+					auto child = path[level];
+					auto side = top.get() == &semantic ? ReducedInput(join, child, semantic) : DConstants::INVALID_INDEX;
+					if (side != DConstants::INVALID_INDEX) {
+						join.children[child] = std::move(semantic.children[side]);
 						semantic.children[side] = std::move(joins[level]);
+						continue;
 					}
+					auto relation = ReducingRelation(join, child, above, tables);
+					if (relation) {
+						join.children[child] = std::move(*relation);
+						*relation = std::move(joins[level]);
+						continue;
+					}
+					// No join moves into a semantic input from here on.
+					if (above.empty())
+						InputTables(semantic, tables);
+					join.children[child] = std::move(top);
+					top = std::move(joins[level]);
+					above.emplace_back(&join, child);
 				}
+				for (auto &entry : above)
+					AddReducers(*entry.first, entry.second, semantic, tables);
 				auto index = optimizer.binder.GenerateTableIndex();
 				vector<unique_ptr<Expression>> output;
 				Fix fix {nullptr, bindings, {}};
