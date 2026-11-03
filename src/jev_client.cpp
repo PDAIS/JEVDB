@@ -38,12 +38,15 @@ static string Quote(const string &value) {
 
 struct Request {
 	string body;
+	bool has_media = false;
 	// Keep indices into the distinct input vector instead of copying both texts
 	// into every request. This changes storage, not ordering or batching rules.
 	vector<idx_t> indices;
 };
 
-static vector<Request> BuildRequests(const Config &config, const string &condition, const vector<Pair> &pairs) {
+static vector<Request> BuildRequests(const HoldsData &data, const vector<Pair> &pairs) {
+	auto &config = data.config;
+	auto &condition = data.condition;
 	std::map<string, idx_t> left_seen, right_seen;
 	double left_chars = 0, right_chars = 0;
 	for (auto &pair : pairs) {
@@ -87,11 +90,15 @@ static vector<Request> BuildRequests(const Config &config, const string &conditi
 			    Quote("p" + std::to_string(slot)) + ":{\"type\":\"noul\",\"instructions\":" + instructions + "}";
 		}
 		request.body += "}}";
+		request.has_media = AttachMedia(*data.state, request.body);
 		requests.push_back(std::move(request));
 	};
 	auto state = "{\"condition\":" + Quote(condition);
 	if (layout == "sep") {
 		for (idx_t i = 0; i < pairs.size(); i++) {
+			if (MediaBytes(*data.state, pairs[i].first) + MediaBytes(*data.state, pairs[i].second) >
+			    MEDIA_REQUEST_BYTES)
+				throw InvalidInputException("Jev image pair is too large; resize the images");
 			emit(state + ",\"left\":" + Quote(pairs[i].first) + ",\"right\":" + Quote(pairs[i].second) + "}", {i});
 		}
 		return requests;
@@ -112,18 +119,27 @@ static vector<Request> BuildRequests(const Config &config, const string &conditi
 		                       : state + ",\"" + (anchor_left ? "left" : "right") + "\":" + Quote(group.first) + "}";
 		double room = config.budget_tokens - (layout == "pack" ? 0 : group.first.size() / 3.5);
 		double used = 0;
+		auto state_bytes = MediaBytes(*data.state, group_state);
+		idx_t used_bytes = state_bytes;
 		vector<idx_t> batch;
 		for (auto index : group.second) {
 			auto &pair = pairs[index];
 			double size = layout == "pack" ? pair.first.size() / 3.5 + pair.second.size() / 3.5
 			                               : (anchor_left ? pair.second.size() : pair.first.size()) / 3.5;
-			if (!batch.empty() && (batch.size() == config.k || used + size > room)) {
+			auto bytes = layout == "pack" ? MediaBytes(*data.state, pair.first) + MediaBytes(*data.state, pair.second)
+			                              : MediaBytes(*data.state, anchor_left ? pair.second : pair.first);
+			if (state_bytes + bytes > MEDIA_REQUEST_BYTES)
+				throw InvalidInputException("Jev image pair is too large; resize the images");
+			if (!batch.empty() &&
+			    (batch.size() == config.k || used + size > room || used_bytes + bytes > MEDIA_REQUEST_BYTES)) {
 				emit(group_state, batch);
 				batch.clear();
 				used = 0;
+				used_bytes = state_bytes;
 			}
 			batch.push_back(index);
 			used += size;
+			used_bytes += bytes;
 		}
 		if (!batch.empty()) {
 			emit(group_state, batch);
@@ -137,22 +153,29 @@ static vector<Request> BuildRecordRequests(const HoldsData &data, const vector<R
 	const auto per_request = data.config.layout == "sep" ? idx_t(1) : data.config.k;
 	const auto criteria_size = data.kind == QuestionKind::NOUL ? 0.0 : data.criteria_json.size() / 3.5;
 	double used = 0;
+	idx_t used_bytes = 0;
 	for (idx_t index = 0; index < records.size(); index++) {
 		auto &record = records[index];
 		double size = criteria_size;
+		idx_t bytes = data.condition.size() + data.criteria_json.size() + 256;
 		for (auto &field : record) {
 			size += (field.first.size() + field.second.size()) / 3.5;
+			bytes += field.first.size() + MediaBytes(*data.state, field.second);
 		}
+		if (bytes > MEDIA_REQUEST_BYTES)
+			throw InvalidInputException("Jev image record is too large; resize the images");
 		if (requests.empty() || requests.back().indices.size() == per_request ||
-		    used + size > data.config.budget_tokens) {
+		    used + size > data.config.budget_tokens || used_bytes + bytes > MEDIA_REQUEST_BYTES) {
 			if (!requests.empty()) {
 				requests.back().body += "}}";
+				requests.back().has_media = AttachMedia(*data.state, requests.back().body);
 			}
 			Request request;
 			request.body = "{\"model\":" + Quote(data.config.model) +
 			               ",\"state\":{\"condition\":" + Quote(data.condition) + "},\"questions\":{";
 			requests.push_back(std::move(request));
 			used = 0;
+			used_bytes = 0;
 		}
 		auto &request = requests.back();
 		const auto slot = request.indices.size();
@@ -176,9 +199,11 @@ static vector<Request> BuildRecordRequests(const HoldsData &data, const vector<R
 		request.body += '}';
 		request.indices.push_back(index);
 		used += size;
+		used_bytes += bytes;
 	}
 	if (!requests.empty()) {
 		requests.back().body += "}}";
+		requests.back().has_media = AttachMedia(*data.state, requests.back().body);
 	}
 	return requests;
 }
@@ -243,8 +268,11 @@ public:
 					started[worker] = true;
 					const auto request_start = Clock::now();
 					auto &response = responses[index];
+					duckdb_httplib_openssl::Headers headers;
+					if (requests[index].has_media)
+						headers.emplace("TypeSafe-Danger-Zone-Images", "true");
 					auto result = PostWithRetries(*clients[worker], path, requests[index].body, config.retry,
-					                              response.retries, state.interrupted);
+					                              response.retries, state.interrupted, headers);
 					response.elapsed_us = Elapsed(request_start);
 					if (result) {
 						response.status = result->status;
@@ -500,7 +528,7 @@ void Judge(HoldsData &data, const vector<Pair> &pairs) {
 		} else if (data.config.backend == "llm") {
 			JudgeLlm(data, &todo, nullptr);
 		} else {
-			Run(data, BuildRequests(data.config, data.condition, todo), &todo, nullptr);
+			Run(data, BuildRequests(data, todo), &todo, nullptr);
 		}
 	}
 }

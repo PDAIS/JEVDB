@@ -21,11 +21,12 @@ namespace jevdb {
 // early when the query is interrupted; the caller then raises the interrupt.
 inline duckdb_httplib_openssl::Result PostWithRetries(duckdb_httplib_openssl::Client &client, const string &path,
                                                       const string &body, const RetryConfig &config, idx_t &retries,
-                                                      const std::atomic<bool> *interrupted) {
+                                                      const std::atomic<bool> *interrupted,
+                                                      const duckdb_httplib_openssl::Headers &headers = {}) {
 	thread_local std::mt19937_64 random {std::random_device {}()};
 	double backoff = 1;
 	while (true) {
-		auto result = client.Post(path, body, "application/json");
+		auto result = client.Post(path, headers, body, "application/json");
 		bool transient;
 		if (result) {
 			transient = result->status == 429 || (result->status >= 500 && result->status < 600);

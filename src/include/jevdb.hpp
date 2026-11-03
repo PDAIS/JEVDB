@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "jevdb_scorer.hpp"
+#include "media.hpp"
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -152,6 +153,9 @@ struct QueryState : ClientContextState {
 	std::map<ConnectionIdentity, shared_ptr<ClientPool>> pools;
 	std::map<CascadeIdentity, CascadeCache> cascades;
 	std::map<ConnectionIdentity, shared_ptr<LlmClientPool>> llm_pools;
+	std::map<string, string> media_paths;
+	std::map<string, MediaAsset> media;
+	ClientContext *context = nullptr;
 	Stats stats;
 	Stats last_stats;
 	bool used = false;
@@ -229,8 +233,8 @@ double Probability(HoldsData &data, const Pair &pair);
 void JudgeRecords(HoldsData &data, const vector<Record> &records);
 double RecordProbability(HoldsData &data, const Record &record);
 string RecordChoice(HoldsData &data, const Record &record);
-bool InputRecord(const Value &value, const vector<string> &names, Record &record);
-bool PairText(const Value &value, const vector<string> &names, string &text);
+bool InputRecord(QueryState &state, const Value &value, const vector<string> &names, Record &record);
+bool PairText(QueryState &state, const Value &value, const vector<string> &names, string &text);
 bool CanUseKeyCandidates(LogicalAnyJoin &join);
 void RegisterStats(ExtensionLoader &loader);
 void PrepareSBF(Optimizer &optimizer, unique_ptr<LogicalOperator> &plan);

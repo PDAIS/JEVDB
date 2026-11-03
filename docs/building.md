@@ -16,6 +16,11 @@ Use `OPENSSL_INCLUDE_DIR`, `OPENSSL_SSL_LIBRARY` and `OPENSSL_CRYPTO_LIBRARY` wh
 headers and libraries are installed separately. The result is
 `build/release/extension/jevdb/jevdb.duckdb_extension`.
 
+The script statically links DuckDB into the extension so it also loads in the
+official CLI and Python package, which do not export the required C++ symbols.
+The first build compiles DuckDB; later builds reuse those objects. Set
+`JEVDB_BUILD_JOBS` to change the default four compiler jobs.
+
 ```sql
 -- Start the matching CLI with -unsigned.
 LOAD '/absolute/path/to/build/release/extension/jevdb/jevdb.duckdb_extension';
@@ -29,6 +34,7 @@ For the example scorer and local regressions:
 ```sh
 bash scripts/build.sh -DJEVDB_BUILD_EXAMPLE_SCORER=ON
 python3 -m unittest tools.test_release -v
+python3 -m unittest tools.test_media -v
 python3 tools/standin/test_jev_standin.py -v
 ```
 

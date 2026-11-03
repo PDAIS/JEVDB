@@ -10,7 +10,7 @@
 **Scalable semantic SQL on decision models.**
 JEVDB (Just Evaluation and Verification Database) is a scalable semantic database
 built on the DuckDB ecosystem. It runs semantic filters, semantic joins,
-classification and scoring over text as part of ordinary SQL.
+classification and scoring over text and images as part of ordinary SQL.
 
 By default JEVDB batches decisions on a Jev model in a single stage. It returns
 probabilities, labels and scores directly, so ordinary semantic filters and joins
@@ -118,6 +118,21 @@ works, and scores every row.
 Inputs can be columns or STRUCTs such as `{'title': title, 'body': body}`; field names are sent
 with the values. Options are a constant STRUCT, for example `{'threshold': 0.3}`. Answers are
 reused within a query for repeated inputs. See [Functions](docs/functions.md).
+
+Use `jev_media('image', {'path': image_path})` for a local PNG or JPEG. Media values
+work on their own, in record STRUCTs, and on either side of a semantic join:
+
+```sql
+SELECT id FROM pictures
+WHERE jev_holds('The image contains a zebra', jev_media('image', {'path': image_path}));
+
+SELECT p.id, i.id FROM products p JOIN pictures i
+  ON jev_holds('The image matches the product description', p.description,
+               jev_media('image', {'path': i.image_path}));
+```
+
+Images currently require the Jev backend without cascade or a custom scorer.
+See [Media inputs](docs/functions.md#media-inputs) for image limits and supported sources.
 
 ## Using an LLM backend
 

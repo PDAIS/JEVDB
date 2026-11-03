@@ -14,6 +14,8 @@ void QueryState::QueryEnd() {
 	pools.clear();
 	cascades.clear();
 	llm_pools.clear();
+	media_paths.clear();
+	media.clear();
 	stats = Stats();
 	used = false;
 }

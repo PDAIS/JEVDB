@@ -376,7 +376,7 @@ static void SetOption(ClientContext &context, Config &config, const string &name
 
 static vector<string> FieldNames(const Expression &expression) {
 	vector<string> names;
-	if (expression.return_type.id() == LogicalTypeId::STRUCT) {
+	if (expression.return_type.id() == LogicalTypeId::STRUCT && !IsMedia(expression.return_type)) {
 		for (auto &field : StructType::GetChildTypes(expression.return_type)) {
 			if (field.first == "question" || field.first == "condition") {
 				throw InvalidInputException("Jev record fields 'question' and 'condition' are reserved");
@@ -398,27 +398,33 @@ static vector<string> FieldNames(const Expression &expression) {
 	return names;
 }
 
-bool InputRecord(const Value &value, const vector<string> &names, Record &record) {
+bool InputRecord(QueryState &state, const Value &value, const vector<string> &names, Record &record) {
 	if (value.IsNull()) {
 		return false;
 	}
-	if (value.type().id() == LogicalTypeId::STRUCT) {
+	if (value.type().id() == LogicalTypeId::STRUCT && !IsMedia(value.type())) {
 		auto &children = StructValue::GetChildren(value);
 		for (idx_t i = 0; i < children.size(); i++) {
 			if (children[i].IsNull()) {
 				return false;
 			}
-			record.emplace_back(names[i], children[i].ToString());
+			string text;
+			if (!MediaText(state, children[i], text))
+				return false;
+			record.emplace_back(names[i], std::move(text));
 		}
 	} else {
-		record.emplace_back(names[0], value.ToString());
+		string text;
+		if (!MediaText(state, value, text))
+			return false;
+		record.emplace_back(names[0], std::move(text));
 	}
 	return true;
 }
 
-bool PairText(const Value &value, const vector<string> &names, string &text) {
+bool PairText(QueryState &state, const Value &value, const vector<string> &names, string &text) {
 	Record fields;
-	if (!InputRecord(value, names, fields)) {
+	if (!InputRecord(state, value, names, fields)) {
 		return false;
 	}
 	for (idx_t i = 0; i < fields.size(); i++) {
@@ -495,6 +501,8 @@ static unique_ptr<FunctionData> BindDecision(ClientContext &context, ScalarFunct
 	idx_t option_idx = DConstants::INVALID_INDEX;
 	data->pairwise = !criteria && arguments.size() >= 3;
 	if (criteria) {
+		if (ContainsMedia(arguments[2]->return_type))
+			throw InvalidInputException("Jev media is supported in inputs, not in choices or score levels");
 		BindCriteria(context, *data, *arguments[2]);
 		if (arguments.size() == 4)
 			option_idx = 3;
@@ -576,7 +584,12 @@ static unique_ptr<FunctionData> BindDecision(ClientContext &context, ScalarFunct
 	function.varargs = LogicalType::INVALID;
 	data->argument_types = function.arguments;
 	data->first_stage = BindFirstStageScorer(context, function, data->pairwise);
+	if (ContainsMedia(arguments[1]->return_type) || (data->pairwise && ContainsMedia(arguments[2]->return_type))) {
+		if (data->config.backend != "jev" || data->config.cascade.Enabled() || data->first_stage)
+			throw InvalidInputException("Jev media inputs require the Jev backend without a cascade or custom scorer");
+	}
 	data->state = context.registered_state->GetOrCreate<QueryState>("jevdb");
+	data->state->context = &context;
 	data->state->interrupted = &context.interrupted;
 	return std::move(data);
 }
@@ -594,13 +607,13 @@ static void ExecuteDecision(DataChunk &input, ExpressionState &expression_state,
 		bool present;
 		if (data.pairwise) {
 			Pair pair;
-			present = PairText(input.GetValue(1, row), data.left_fields, pair.first) &&
-			          PairText(input.GetValue(2, row), data.right_fields, pair.second);
+			present = PairText(*data.state, input.GetValue(1, row), data.left_fields, pair.first) &&
+			          PairText(*data.state, input.GetValue(2, row), data.right_fields, pair.second);
 			if (present)
 				pairs.push_back(std::move(pair));
 		} else {
 			Record record;
-			present = InputRecord(input.GetValue(1, row), data.left_fields, record);
+			present = InputRecord(*data.state, input.GetValue(1, row), data.left_fields, record);
 			if (present)
 				records.push_back(std::move(record));
 		}
@@ -845,6 +858,7 @@ static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 
 static void Load(ExtensionLoader &loader) {
 	RegisterApiSecrets(loader);
+	RegisterMedia(loader);
 	auto scorer_api = CreateFirstStageScorerAPI();
 	for (auto mode : {DecisionMode::HOLDS, DecisionMode::PROBABILITY, DecisionMode::CHOICE, DecisionMode::SCORE}) {
 		auto function = DecisionFunction(mode);

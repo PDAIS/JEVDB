@@ -24,10 +24,10 @@ static vector<LogicalType> InputTypes(const BoundFunctionExpression &holds) {
 
 static bool ReadDecision(HoldsData &data, DataChunk &values, idx_t row, Pair &pair, Record &record) {
 	if (data.pairwise) {
-		return PairText(values.GetValue(0, row), data.left_fields, pair.first) &&
-		       PairText(values.GetValue(1, row), data.right_fields, pair.second);
+		return PairText(*data.state, values.GetValue(0, row), data.left_fields, pair.first) &&
+		       PairText(*data.state, values.GetValue(1, row), data.right_fields, pair.second);
 	}
-	return InputRecord(values.GetValue(0, row), data.left_fields, record);
+	return InputRecord(*data.state, values.GetValue(0, row), data.left_fields, record);
 }
 
 static bool DecisionMatches(HoldsData &data, const Pair &pair, const Record &record) {
